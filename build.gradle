@@ -1,3 +1,13 @@
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        // Web3j 4.14.0 brings an older Sokt whose releases.json lookup fails in Gradle's isolated classloader.
+        classpath 'org.web3j:web3j-sokt:0.7.0'
+    }
+}
+
 plugins {
     id 'java'
     id 'org.springframework.boot' version '3.2.3'
