@@ -5,9 +5,13 @@ import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.web3j.abi.EventEncoder;
 import org.web3j.crypto.Credentials;
 import org.web3j.protocol.Web3j;
 import org.web3j.protocol.core.DefaultBlockParameter;
+import org.web3j.protocol.core.methods.request.EthFilter;
+import org.web3j.protocol.core.methods.response.EthLog;
+import org.web3j.protocol.core.methods.response.Log;
 import org.web3j.protocol.core.methods.response.TransactionReceipt;
 import org.web3j.tx.gas.ContractGasProvider;
 
@@ -17,6 +21,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @Service
@@ -24,6 +29,10 @@ import java.util.concurrent.CompletableFuture;
 public class EscrowService {
 
     private static final BigInteger MAX_EVENT_QUERY_BLOCKS = BigInteger.TEN;
+
+    private static final int MAX_LOG_QUERY_ATTEMPTS = 3;
+
+    private static final long LOG_QUERY_RETRY_DELAY_SECONDS = 1L;
 
     private static final String[] STATUS = {
             "Created", "Paid", "Completed", "Refunded", "Disputed"
@@ -127,12 +136,26 @@ public class EscrowService {
 
         BigInteger toBlock = fromBlock.add(MAX_EVENT_QUERY_BLOCKS).subtract(BigInteger.ONE)
                 .min(latestBlock);
-        CompletableFuture<List<Escrow.OrderCreatedEventResponse>> batchFuture = new CompletableFuture<>();
-        contract.orderCreatedEventFlowable(
-                        DefaultBlockParameter.valueOf(fromBlock),
-                        DefaultBlockParameter.valueOf(toBlock))
-                .toList()
-                .subscribe(batchFuture::complete, batchFuture::completeExceptionally);
+        EthFilter filter = new EthFilter(
+                DefaultBlockParameter.valueOf(fromBlock),
+                DefaultBlockParameter.valueOf(toBlock),
+                contractAddress
+        );
+        filter.addSingleTopic(EventEncoder.encode(Escrow.ORDERCREATED_EVENT));
+
+        CompletableFuture<List<Escrow.OrderCreatedEventResponse>> batchFuture =
+                queryLogsWithRetry(filter, MAX_LOG_QUERY_ATTEMPTS).thenApply(response -> {
+                    if (response.hasError()) {
+                        throw new IllegalStateException(
+                                "Failed to query OrderCreated events: "
+                                        + response.getError().getMessage()
+                        );
+                    }
+                    return response.getLogs().stream()
+                            .map(logResult -> (Log) logResult.get())
+                            .map(Escrow::getOrderCreatedEventFromLog)
+                            .toList();
+                });
 
         BigInteger nextFromBlock = toBlock.add(BigInteger.ONE);
         return batchFuture.thenCompose(batch -> collectOrderCreatedEvents(nextFromBlock, latestBlock)
@@ -142,6 +165,48 @@ public class EscrowService {
                     events.addAll(remaining);
                     return events;
                 }));
+    }
+
+    private CompletableFuture<EthLog> queryLogsWithRetry(
+            EthFilter filter, int attemptsRemaining) {
+        CompletableFuture<EthLog> result = new CompletableFuture<>();
+
+        web3j.ethGetLogs(filter).sendAsync().whenComplete((response, error) -> {
+            Throwable failure = error;
+            if (failure == null && response == null) {
+                failure = new IllegalStateException("Empty response from eth_getLogs");
+            } else if (failure == null && response.hasError()) {
+                failure = new IllegalStateException(
+                        "Failed to query OrderCreated events: "
+                                + response.getError().getMessage()
+                );
+            }
+
+            if (failure == null) {
+                result.complete(response);
+                return;
+            }
+
+            if (attemptsRemaining <= 1) {
+                result.completeExceptionally(failure);
+                return;
+            }
+
+            log.warn("eth_getLogs failed; retrying in {} second(s), {} attempt(s) remaining",
+                    LOG_QUERY_RETRY_DELAY_SECONDS, attemptsRemaining - 1, failure);
+            CompletableFuture.delayedExecutor(
+                    LOG_QUERY_RETRY_DELAY_SECONDS, TimeUnit.SECONDS
+            ).execute(() -> queryLogsWithRetry(filter, attemptsRemaining - 1)
+                    .whenComplete((retryResponse, retryError) -> {
+                        if (retryError == null) {
+                            result.complete(retryResponse);
+                        } else {
+                            result.completeExceptionally(retryError);
+                        }
+                    }));
+        });
+
+        return result;
     }
 
     /**
